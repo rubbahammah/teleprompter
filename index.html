@@ -80,6 +80,11 @@ Your front camera displays behind the script so you maintain eye contact while r
     <!-- Top Bar Controls -->
     <div class="absolute top-4 left-4 right-4 z-20 flex justify-between items-center pointer-events-none">
       <button id="exitBtn" class="pointer-events-auto bg-slate-950/80 backdrop-blur text-white text-xs px-3 py-2 rounded-lg border border-slate-700">✕ Exit</button>
+
+      <a id="topDownloadBtn" download="teleprompter-recording.mp4" class="hidden pointer-events-auto bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-3.5 py-2 rounded-lg shadow-lg">
+        ⬇ Save MP4
+      </a>
+
       <div id="recIndicator" class="hidden bg-red-600 text-white text-xs font-bold px-3 py-1.5 rounded-full flex items-center gap-2 shadow-lg">
         <span class="w-2 h-2 rounded-full bg-white animate-ping"></span>
         <span>REC</span>
@@ -133,6 +138,7 @@ Your front camera displays behind the script so you maintain eye contact while r
     const downloadBanner = document.getElementById('downloadBanner');
     const downloadInfo = document.getElementById('downloadInfo');
     const downloadBtn = document.getElementById('downloadBtn');
+    const topDownloadBtn = document.getElementById('topDownloadBtn');
 
     let stream = null;
     let isScrolling = false;
@@ -140,9 +146,14 @@ Your front camera displays behind the script so you maintain eye contact while r
     let scrollSpeed = 2;
     let timerInterval = null;
     let recStartTime = 0;
-
-    // WebCodecs + Mp4Muxer state
     let activeStopHandler = null;
+    let lastBlobUrl = null;
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const withTimeout = (promise, ms) => Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Operation timed out')), ms))
+    ]);
 
     speedSlider.addEventListener('input', (e) => {
       scrollSpeed = parseFloat(e.target.value);
@@ -211,6 +222,7 @@ Your front camera displays behind the script so you maintain eye contact while r
         recordDot.classList.replace('bg-white', 'bg-red-600');
         recordDot.classList.remove('rounded-full');
         recIndicator.classList.remove('hidden');
+        topDownloadBtn.classList.add('hidden');
         startTimer();
       } else {
         isRecording = false;
@@ -226,16 +238,84 @@ Your front camera displays behind the script so you maintain eye contact while r
     }
 
     function publishDownload(blob, ext, durationMs) {
+      if (lastBlobUrl) URL.revokeObjectURL(lastBlobUrl);
       const url = URL.createObjectURL(blob);
+      lastBlobUrl = url;
+
       const formatted = formatDuration(durationMs);
+      const filename = `teleprompter-${Date.now()}.${ext}`;
+
       downloadBtn.href = url;
-      downloadBtn.download = `teleprompter-${Date.now()}.${ext}`;
+      downloadBtn.download = filename;
       downloadBtn.textContent = `Save Video (.${ext})`;
       downloadInfo.textContent = `Recording ready (${formatted})!`;
       downloadBanner.classList.remove('hidden');
+
+      topDownloadBtn.href = url;
+      topDownloadBtn.download = filename;
+      topDownloadBtn.textContent = `⬇ Save .${ext.toUpperCase()} (${formatted})`;
+      topDownloadBtn.classList.remove('hidden');
     }
 
-    // Primary Recorder: WebCodecs + Mp4Muxer (Standard non-fragmented MP4 with exact duration header)
+    // Patches mvhd, tkhd, and mdhd duration atoms in MediaRecorder MP4 blobs
+    function patchMp4Duration(buffer, durationMs) {
+      const view = new DataView(buffer);
+      let mvhdTimescale = 1000;
+
+      function walkBoxes(start, end) {
+        let offset = start;
+        while (offset + 8 <= end) {
+          const size = view.getUint32(offset);
+          if (size < 8 || offset + size > end) break;
+          const type = String.fromCharCode(
+            view.getUint8(offset + 4),
+            view.getUint8(offset + 5),
+            view.getUint8(offset + 6),
+            view.getUint8(offset + 7)
+          );
+          const payload = offset + 8;
+
+          if (type === 'moov' || type === 'trak' || type === 'mdia') {
+            walkBoxes(payload, offset + size);
+          } else if (type === 'mvhd' && payload + 20 <= offset + size) {
+            const v = view.getUint8(payload);
+            if (v === 0) {
+              mvhdTimescale = view.getUint32(payload + 12) || 1000;
+              view.setUint32(payload + 16, Math.round((durationMs / 1000) * mvhdTimescale));
+            } else if (v === 1 && payload + 32 <= offset + size) {
+              mvhdTimescale = view.getUint32(payload + 20) || 1000;
+              view.setBigUint64(payload + 24, BigInt(Math.round((durationMs / 1000) * mvhdTimescale)));
+            }
+          } else if (type === 'tkhd' && payload + 24 <= offset + size) {
+            const v = view.getUint8(payload);
+            if (v === 0) {
+              view.setUint32(payload + 20, Math.round((durationMs / 1000) * mvhdTimescale));
+            } else if (v === 1 && payload + 36 <= offset + size) {
+              view.setBigUint64(payload + 28, BigInt(Math.round((durationMs / 1000) * mvhdTimescale)));
+            }
+          } else if (type === 'mdhd' && payload + 20 <= offset + size) {
+            const v = view.getUint8(payload);
+            if (v === 0) {
+              const ts = view.getUint32(payload + 12) || 1000;
+              view.setUint32(payload + 16, Math.round((durationMs / 1000) * ts));
+            } else if (v === 1 && payload + 32 <= offset + size) {
+              const ts = view.getUint32(payload + 20) || 1000;
+              view.setBigUint64(payload + 24, BigInt(Math.round((durationMs / 1000) * ts)));
+            }
+          }
+          offset += size;
+        }
+      }
+
+      try {
+        walkBoxes(0, buffer.byteLength);
+      } catch (e) {
+        console.warn('MP4 header patch skipped:', e);
+      }
+      return buffer;
+    }
+
+    // Primary Recorder: WebCodecs + Mp4Muxer with cloned tracks
     async function startWebCodecsMp4Recorder(mediaStream) {
       if (
         typeof Mp4Muxer === 'undefined' ||
@@ -246,157 +326,220 @@ Your front camera displays behind the script so you maintain eye contact while r
         throw new Error('WebCodecs unavailable');
       }
 
-      const videoTrack = mediaStream.getVideoTracks()[0];
-      const audioTrack = mediaStream.getAudioTracks()[0];
-      if (!videoTrack || !audioTrack) throw new Error('Missing audio or video track');
+      const origVideoTrack = mediaStream.getVideoTracks()[0];
+      const origAudioTrack = mediaStream.getAudioTracks()[0];
+      if (!origVideoTrack || !origAudioTrack) throw new Error('Missing audio or video track');
 
-      const videoReader = new MediaStreamTrackProcessor({ track: videoTrack }).readable.getReader();
-      const audioReader = new MediaStreamTrackProcessor({ track: audioTrack }).readable.getReader();
+      // Clone tracks so stopping them cleanly closes the readers without affecting live preview
+      const recVideoTrack = origVideoTrack.clone();
+      const recAudioTrack = origAudioTrack.clone();
 
-      // Read first frame and audio packet to lock exact hardware dimensions and sample rate
-      const [firstVidRes, firstAudRes] = await Promise.all([videoReader.read(), audioReader.read()]);
-      if (firstVidRes.done || firstAudRes.done || !firstVidRes.value || !firstAudRes.value) {
-        throw new Error('Failed to read initial media frames');
-      }
+      let videoReader, audioReader;
+      try {
+        videoReader = new MediaStreamTrackProcessor({ track: recVideoTrack }).readable.getReader();
+        audioReader = new MediaStreamTrackProcessor({ track: recAudioTrack }).readable.getReader();
 
-      const firstFrame = firstVidRes.value;
-      const firstAudio = firstAudRes.value;
+        const [firstVidRes, firstAudRes] = await withTimeout(
+          Promise.all([videoReader.read(), audioReader.read()]),
+          2500
+        );
 
-      const width = (firstFrame.codedWidth || 720) & ~1;
-      const height = (firstFrame.codedHeight || 1280) & ~1;
-      const sampleRate = firstAudio.sampleRate || 48000;
-      const numberOfChannels = firstAudio.numberOfChannels || 1;
+        if (firstVidRes.done || firstAudRes.done || !firstVidRes.value || !firstAudRes.value) {
+          throw new Error('Initial frame read failed');
+        }
 
-      const avcCandidates = ['avc1.4d002a', 'avc1.42002a', 'avc1.64002a', 'avc1.42001f'];
-      let chosenAvc = null;
-      for (const codec of avcCandidates) {
-        const support = await VideoEncoder.isConfigSupported({
-          codec,
+        const firstFrame = firstVidRes.value;
+        const firstAudio = firstAudRes.value;
+
+        const rawW = firstFrame.codedWidth || 720;
+        const rawH = firstFrame.codedHeight || 1280;
+        // Align to 16px macroblocks for Android hardware H.264 encoders
+        const width = Math.max(16, Math.floor(rawW / 16) * 16);
+        const height = Math.max(16, Math.floor(rawH / 16) * 16);
+        const needsResize = (width !== rawW || height !== rawH);
+
+        let resizeCanvas = null;
+        let resizeCtx = null;
+        if (needsResize) {
+          resizeCanvas = document.createElement('canvas');
+          resizeCanvas.width = width;
+          resizeCanvas.height = height;
+          resizeCtx = resizeCanvas.getContext('2d');
+        }
+
+        const normalizeFrame = (frame) => {
+          if (!needsResize) return frame;
+          resizeCtx.drawImage(frame, 0, 0, width, height);
+          const aligned = new VideoFrame(resizeCanvas, { timestamp: frame.timestamp });
+          frame.close();
+          return aligned;
+        };
+
+        const sampleRate = firstAudio.sampleRate || 48000;
+        const numberOfChannels = firstAudio.numberOfChannels || 1;
+
+        const avcCandidates = ['avc1.42002a', 'avc1.4d002a', 'avc1.64002a', 'avc1.42001f'];
+        let chosenAvc = null;
+        for (const codec of avcCandidates) {
+          const support = await VideoEncoder.isConfigSupported({
+            codec,
+            width,
+            height,
+            bitrate: 2_500_000,
+            framerate: 30
+          });
+          if (support.supported) {
+            chosenAvc = codec;
+            break;
+          }
+        }
+
+        const aacSupport = await AudioEncoder.isConfigSupported({
+          codec: 'mp4a.40.2',
+          numberOfChannels,
+          sampleRate,
+          bitrate: 128_000
+        });
+
+        if (!chosenAvc || !aacSupport.supported) {
+          firstFrame.close();
+          firstAudio.close();
+          throw new Error('Hardware H.264/AAC config unsupported');
+        }
+
+        let encoderFailed = false;
+        const muxer = new Mp4Muxer.Muxer({
+          target: new Mp4Muxer.ArrayBufferTarget(),
+          video: { codec: 'avc', width, height },
+          audio: { codec: 'aac', numberOfChannels, sampleRate },
+          fastStart: 'in-memory',
+          firstTimestampBehavior: 'offset'
+        });
+
+        const videoEncoder = new VideoEncoder({
+          output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+          error: (e) => {
+            console.error('VideoEncoder error:', e);
+            encoderFailed = true;
+          }
+        });
+        videoEncoder.configure({
+          codec: chosenAvc,
           width,
           height,
-          bitrate: 3_000_000,
+          bitrate: 2_500_000,
           framerate: 30
         });
-        if (support.supported) {
-          chosenAvc = codec;
-          break;
-        }
-      }
 
-      const aacSupport = await AudioEncoder.isConfigSupported({
-        codec: 'mp4a.40.2',
-        numberOfChannels,
-        sampleRate,
-        bitrate: 128_000
-      });
+        const audioEncoder = new AudioEncoder({
+          output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+          error: (e) => {
+            console.error('AudioEncoder error:', e);
+            encoderFailed = true;
+          }
+        });
+        audioEncoder.configure({
+          codec: 'mp4a.40.2',
+          numberOfChannels,
+          sampleRate,
+          bitrate: 128_000
+        });
 
-      if (!chosenAvc || !aacSupport.supported) {
-        firstFrame.close();
+        setRecordingUI(true);
+
+        let videoFrameCount = 0;
+        const initialAlignedFrame = normalizeFrame(firstFrame);
+        videoEncoder.encode(initialAlignedFrame, { keyFrame: true });
+        initialAlignedFrame.close();
+        videoFrameCount++;
+
+        audioEncoder.encode(firstAudio);
         firstAudio.close();
-        await Promise.allSettled([videoReader.cancel(), audioReader.cancel()]);
-        throw new Error('H.264 or AAC WebCodecs config unsupported');
-      }
 
-      const muxer = new Mp4Muxer.Muxer({
-        target: new Mp4Muxer.ArrayBufferTarget(),
-        video: { codec: 'avc', width, height },
-        audio: { codec: 'aac', numberOfChannels, sampleRate },
-        fastStart: 'in-memory',
-        firstTimestampBehavior: 'offset'
-      });
-
-      const videoEncoder = new VideoEncoder({
-        output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-        error: (e) => console.error('VideoEncoder error:', e)
-      });
-      videoEncoder.configure({
-        codec: chosenAvc,
-        width,
-        height,
-        bitrate: 3_000_000,
-        framerate: 30
-      });
-
-      const audioEncoder = new AudioEncoder({
-        output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
-        error: (e) => console.error('AudioEncoder error:', e)
-      });
-      audioEncoder.configure({
-        codec: 'mp4a.40.2',
-        numberOfChannels,
-        sampleRate,
-        bitrate: 128_000
-      });
-
-      setRecordingUI(true);
-
-      let videoFrameCount = 0;
-      videoEncoder.encode(firstFrame, { keyFrame: true });
-      firstFrame.close();
-      videoFrameCount++;
-
-      audioEncoder.encode(firstAudio);
-      firstAudio.close();
-
-      const pumpVideo = (async () => {
-        try {
-          while (isRecording) {
-            const { value: frame, done } = await videoReader.read();
-            if (done || !frame) break;
-            if (!isRecording) {
-              frame.close();
-              break;
-            }
-            if (videoEncoder.state === 'configured') {
-              videoEncoder.encode(frame, { keyFrame: videoFrameCount % 60 === 0 });
+        const pumpVideo = (async () => {
+          try {
+            while (isRecording && !encoderFailed) {
+              const { value: frame, done } = await videoReader.read();
+              if (done || !frame) break;
+              if (!isRecording || encoderFailed || videoEncoder.state !== 'configured') {
+                frame.close();
+                break;
+              }
+              const readyFrame = normalizeFrame(frame);
+              videoEncoder.encode(readyFrame, { keyFrame: videoFrameCount % 60 === 0 });
+              readyFrame.close();
               videoFrameCount++;
             }
-            frame.close();
-          }
-        } catch (_) {}
-      })();
+          } catch (_) {}
+        })();
 
-      const pumpAudio = (async () => {
-        try {
-          while (isRecording) {
-            const { value: data, done } = await audioReader.read();
-            if (done || !data) break;
-            if (!isRecording) {
-              data.close();
-              break;
-            }
-            if (audioEncoder.state === 'configured') {
+        const pumpAudio = (async () => {
+          try {
+            while (isRecording && !encoderFailed) {
+              const { value: data, done } = await audioReader.read();
+              if (done || !data) break;
+              if (!isRecording || encoderFailed || audioEncoder.state !== 'configured') {
+                data.close();
+                break;
+              }
               audioEncoder.encode(data);
+              data.close();
             }
-            data.close();
+          } catch (_) {}
+        })();
+
+        activeStopHandler = async () => {
+          const durationMs = stopTimer();
+          setRecordingUI(false);
+          recordToggleBtn.disabled = true;
+          recordLabel.textContent = 'Saving...';
+
+          try {
+            // Stopping cloned tracks immediately ends both readable streams
+            recVideoTrack.stop();
+            recAudioTrack.stop();
+
+            await Promise.race([
+              Promise.allSettled([pumpVideo, pumpAudio]),
+              sleep(1200)
+            ]);
+
+            if (!encoderFailed) {
+              if (videoEncoder.state === 'configured') {
+                await Promise.race([videoEncoder.flush(), sleep(2000)]);
+              }
+              if (audioEncoder.state === 'configured') {
+                await Promise.race([audioEncoder.flush(), sleep(1500)]);
+              }
+            }
+
+            if (videoEncoder.state !== 'closed') videoEncoder.close();
+            if (audioEncoder.state !== 'closed') audioEncoder.close();
+
+            muxer.finalize();
+            const buffer = muxer.target.buffer;
+            if (!buffer || buffer.byteLength < 1024) {
+              throw new Error('Empty MP4 buffer generated');
+            }
+
+            const blob = new Blob([buffer], { type: 'video/mp4' });
+            publishDownload(blob, 'mp4', durationMs);
+          } catch (err) {
+            console.error('Stop finalization error:', err);
+            alert('Unable to finalize video file. Please try recording again.');
+          } finally {
+            recordToggleBtn.disabled = false;
+            recordLabel.textContent = 'Record';
           }
-        } catch (_) {}
-      })();
-
-      activeStopHandler = async () => {
-        const durationMs = stopTimer();
-        setRecordingUI(false);
-        recordToggleBtn.disabled = true;
-        recordLabel.textContent = 'Saving...';
-
-        await Promise.allSettled([videoReader.cancel(), audioReader.cancel()]);
-        await Promise.allSettled([pumpVideo, pumpAudio]);
-
-        if (videoEncoder.state === 'configured') await videoEncoder.flush();
-        if (audioEncoder.state === 'configured') await audioEncoder.flush();
-        if (videoEncoder.state !== 'closed') videoEncoder.close();
-        if (audioEncoder.state !== 'closed') audioEncoder.close();
-
-        muxer.finalize();
-        const blob = new Blob([muxer.target.buffer], { type: 'video/mp4' });
-        publishDownload(blob, 'mp4', durationMs);
-
-        recordToggleBtn.disabled = false;
-        recordLabel.textContent = 'Record';
-      };
+        };
+      } catch (setupErr) {
+        recVideoTrack.stop();
+        recAudioTrack.stop();
+        throw setupErr;
+      }
     }
 
-    // Fallback Recorder: Single-cluster MediaRecorder (no 250ms fragmentation)
+    // Fallback Recorder: Single-cluster MediaRecorder with MP4 duration header patching
     function startFallbackRecorder(mediaStream) {
       const preferredTypes = [
         'video/mp4;codecs=avc1,mp4a.40.2',
@@ -413,20 +556,37 @@ Your front camera displays behind the script so you maintain eye contact while r
       };
 
       setRecordingUI(true);
-      recorder.start(); // No timeslice argument prevents multi-fragment 00:00 header corruption
+      recorder.start();
 
-      activeStopHandler = () => new Promise((resolve) => {
+      activeStopHandler = async () => {
         const durationMs = stopTimer();
         setRecordingUI(false);
-        recorder.onstop = () => {
+        recordToggleBtn.disabled = true;
+        recordLabel.textContent = 'Saving...';
+
+        try {
+          await new Promise((resolve) => {
+            recorder.onstop = resolve;
+            recorder.stop();
+          });
+
           const finalMime = recorder.mimeType || selectedMimeType || 'video/mp4';
-          const ext = finalMime.includes('mp4') ? 'mp4' : 'webm';
-          const blob = new Blob(chunks, { type: finalMime });
-          publishDownload(blob, ext, durationMs);
-          resolve();
-        };
-        recorder.stop();
-      });
+          const isMp4 = finalMime.includes('mp4');
+          const ext = isMp4 ? 'mp4' : 'webm';
+          let rawBlob = new Blob(chunks, { type: finalMime });
+
+          if (isMp4) {
+            const buf = await rawBlob.arrayBuffer();
+            patchMp4Duration(buf, durationMs);
+            rawBlob = new Blob([buf], { type: 'video/mp4' });
+          }
+
+          publishDownload(rawBlob, ext, durationMs);
+        } finally {
+          recordToggleBtn.disabled = false;
+          recordLabel.textContent = 'Record';
+        }
+      };
     }
 
     launchBtn.addEventListener('click', async () => {
@@ -460,7 +620,7 @@ Your front camera displays behind the script so you maintain eye contact while r
         try {
           await startWebCodecsMp4Recorder(stream);
         } catch (err) {
-          console.warn('Falling back to MediaRecorder:', err);
+          console.warn('Using fallback recorder:', err);
           startFallbackRecorder(stream);
         }
       } else if (activeStopHandler) {
