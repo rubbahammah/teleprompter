@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>Mobile Teleprompter & Video Recorder</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.js"></script>
   <style>
     .no-scrollbar::-webkit-scrollbar { display: none; }
     .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
@@ -19,11 +20,11 @@
         <span class="w-3 h-3 rounded-full bg-red-500 animate-pulse"></span>
         Video Teleprompter
       </h1>
-      <span class="text-xs bg-slate-800 text-slate-400 px-2.5 py-1 rounded-full border border-slate-700">MP4 Ready</span>
+      <span class="text-xs bg-slate-800 text-slate-400 px-2.5 py-1 rounded-full border border-slate-700">Editor-Ready MP4</span>
     </header>
 
     <div id="downloadBanner" class="hidden mt-3 p-3 bg-emerald-950/80 border border-emerald-600 rounded-xl flex items-center justify-between">
-      <span class="text-xs font-medium text-emerald-200">Recording ready!</span>
+      <span id="downloadInfo" class="text-xs font-medium text-emerald-200">Recording ready!</span>
       <a id="downloadBtn" download="teleprompter-recording.mp4" class="bg-emerald-600 hover:bg-emerald-500 px-3 py-1.5 rounded-lg text-xs font-semibold text-white transition">Save Video (.mp4)</a>
     </div>
 
@@ -79,8 +80,10 @@ Your front camera displays behind the script so you maintain eye contact while r
     <!-- Top Bar Controls -->
     <div class="absolute top-4 left-4 right-4 z-20 flex justify-between items-center pointer-events-none">
       <button id="exitBtn" class="pointer-events-auto bg-slate-950/80 backdrop-blur text-white text-xs px-3 py-2 rounded-lg border border-slate-700">✕ Exit</button>
-      <div id="recIndicator" class="hidden bg-red-600 text-white text-xs font-bold px-3 py-1.5 rounded-full flex items-center gap-2 animate-pulse">
-        <span class="w-2 h-2 rounded-full bg-white"></span> REC
+      <div id="recIndicator" class="hidden bg-red-600 text-white text-xs font-bold px-3 py-1.5 rounded-full flex items-center gap-2 shadow-lg">
+        <span class="w-2 h-2 rounded-full bg-white animate-ping"></span>
+        <span>REC</span>
+        <span id="recTimer" class="font-mono">00:00</span>
       </div>
     </div>
 
@@ -123,19 +126,23 @@ Your front camera displays behind the script so you maintain eye contact while r
     const recordLabel = document.getElementById('recordLabel');
     const recordDot = document.getElementById('recordDot');
     const recIndicator = document.getElementById('recIndicator');
+    const recTimer = document.getElementById('recTimer');
     const currentSpeedLabel = document.getElementById('currentSpeedLabel');
     const speedMinus = document.getElementById('speedMinus');
     const speedPlus = document.getElementById('speedPlus');
     const downloadBanner = document.getElementById('downloadBanner');
+    const downloadInfo = document.getElementById('downloadInfo');
     const downloadBtn = document.getElementById('downloadBtn');
 
     let stream = null;
-    let mediaRecorder = null;
-    let recordedChunks = [];
     let isScrolling = false;
     let isRecording = false;
     let scrollSpeed = 2;
-    let animId = null;
+    let timerInterval = null;
+    let recStartTime = 0;
+
+    // WebCodecs + Mp4Muxer state
+    let activeStopHandler = null;
 
     speedSlider.addEventListener('input', (e) => {
       scrollSpeed = parseFloat(e.target.value);
@@ -165,9 +172,262 @@ Your front camera displays behind the script so you maintain eye contact while r
       if (isScrolling && prompterScrollBox) {
         prompterScrollBox.scrollTop += scrollSpeed * 0.75;
       }
-      animId = requestAnimationFrame(scrollStep);
+      requestAnimationFrame(scrollStep);
     }
-    animId = requestAnimationFrame(scrollStep);
+    requestAnimationFrame(scrollStep);
+
+    function formatDuration(ms) {
+      const totalSec = Math.max(1, Math.round(ms / 1000));
+      const mins = String(Math.floor(totalSec / 60)).padStart(2, '0');
+      const secs = String(totalSec % 60).padStart(2, '0');
+      return `${mins}:${secs}`;
+    }
+
+    function startTimer() {
+      recStartTime = performance.now();
+      recTimer.textContent = '00:00';
+      timerInterval = setInterval(() => {
+        const elapsed = Math.floor((performance.now() - recStartTime) / 1000);
+        const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
+        const s = String(elapsed % 60).padStart(2, '0');
+        recTimer.textContent = `${m}:${s}`;
+      }, 250);
+    }
+
+    function stopTimer() {
+      clearInterval(timerInterval);
+      timerInterval = null;
+      return performance.now() - recStartTime;
+    }
+
+    function setRecordingUI(active) {
+      if (active) {
+        isRecording = true;
+        isScrolling = true;
+        playPauseIcon.textContent = '❚❚';
+        recordLabel.textContent = 'Stop';
+        recordToggleBtn.classList.replace('bg-red-600', 'bg-slate-200');
+        recordToggleBtn.classList.replace('text-white', 'text-slate-950');
+        recordDot.classList.replace('bg-white', 'bg-red-600');
+        recordDot.classList.remove('rounded-full');
+        recIndicator.classList.remove('hidden');
+        startTimer();
+      } else {
+        isRecording = false;
+        isScrolling = false;
+        playPauseIcon.textContent = '▶';
+        recordLabel.textContent = 'Record';
+        recordToggleBtn.classList.replace('bg-slate-200', 'bg-red-600');
+        recordToggleBtn.classList.replace('text-slate-950', 'text-white');
+        recordDot.classList.replace('bg-red-600', 'bg-white');
+        recordDot.classList.add('rounded-full');
+        recIndicator.classList.add('hidden');
+      }
+    }
+
+    function publishDownload(blob, ext, durationMs) {
+      const url = URL.createObjectURL(blob);
+      const formatted = formatDuration(durationMs);
+      downloadBtn.href = url;
+      downloadBtn.download = `teleprompter-${Date.now()}.${ext}`;
+      downloadBtn.textContent = `Save Video (.${ext})`;
+      downloadInfo.textContent = `Recording ready (${formatted})!`;
+      downloadBanner.classList.remove('hidden');
+    }
+
+    // Primary Recorder: WebCodecs + Mp4Muxer (Standard non-fragmented MP4 with exact duration header)
+    async function startWebCodecsMp4Recorder(mediaStream) {
+      if (
+        typeof Mp4Muxer === 'undefined' ||
+        typeof VideoEncoder === 'undefined' ||
+        typeof AudioEncoder === 'undefined' ||
+        typeof MediaStreamTrackProcessor === 'undefined'
+      ) {
+        throw new Error('WebCodecs unavailable');
+      }
+
+      const videoTrack = mediaStream.getVideoTracks()[0];
+      const audioTrack = mediaStream.getAudioTracks()[0];
+      if (!videoTrack || !audioTrack) throw new Error('Missing audio or video track');
+
+      const videoReader = new MediaStreamTrackProcessor({ track: videoTrack }).readable.getReader();
+      const audioReader = new MediaStreamTrackProcessor({ track: audioTrack }).readable.getReader();
+
+      // Read first frame and audio packet to lock exact hardware dimensions and sample rate
+      const [firstVidRes, firstAudRes] = await Promise.all([videoReader.read(), audioReader.read()]);
+      if (firstVidRes.done || firstAudRes.done || !firstVidRes.value || !firstAudRes.value) {
+        throw new Error('Failed to read initial media frames');
+      }
+
+      const firstFrame = firstVidRes.value;
+      const firstAudio = firstAudRes.value;
+
+      const width = (firstFrame.codedWidth || 720) & ~1;
+      const height = (firstFrame.codedHeight || 1280) & ~1;
+      const sampleRate = firstAudio.sampleRate || 48000;
+      const numberOfChannels = firstAudio.numberOfChannels || 1;
+
+      const avcCandidates = ['avc1.4d002a', 'avc1.42002a', 'avc1.64002a', 'avc1.42001f'];
+      let chosenAvc = null;
+      for (const codec of avcCandidates) {
+        const support = await VideoEncoder.isConfigSupported({
+          codec,
+          width,
+          height,
+          bitrate: 3_000_000,
+          framerate: 30
+        });
+        if (support.supported) {
+          chosenAvc = codec;
+          break;
+        }
+      }
+
+      const aacSupport = await AudioEncoder.isConfigSupported({
+        codec: 'mp4a.40.2',
+        numberOfChannels,
+        sampleRate,
+        bitrate: 128_000
+      });
+
+      if (!chosenAvc || !aacSupport.supported) {
+        firstFrame.close();
+        firstAudio.close();
+        await Promise.allSettled([videoReader.cancel(), audioReader.cancel()]);
+        throw new Error('H.264 or AAC WebCodecs config unsupported');
+      }
+
+      const muxer = new Mp4Muxer.Muxer({
+        target: new Mp4Muxer.ArrayBufferTarget(),
+        video: { codec: 'avc', width, height },
+        audio: { codec: 'aac', numberOfChannels, sampleRate },
+        fastStart: 'in-memory',
+        firstTimestampBehavior: 'offset'
+      });
+
+      const videoEncoder = new VideoEncoder({
+        output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+        error: (e) => console.error('VideoEncoder error:', e)
+      });
+      videoEncoder.configure({
+        codec: chosenAvc,
+        width,
+        height,
+        bitrate: 3_000_000,
+        framerate: 30
+      });
+
+      const audioEncoder = new AudioEncoder({
+        output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+        error: (e) => console.error('AudioEncoder error:', e)
+      });
+      audioEncoder.configure({
+        codec: 'mp4a.40.2',
+        numberOfChannels,
+        sampleRate,
+        bitrate: 128_000
+      });
+
+      setRecordingUI(true);
+
+      let videoFrameCount = 0;
+      videoEncoder.encode(firstFrame, { keyFrame: true });
+      firstFrame.close();
+      videoFrameCount++;
+
+      audioEncoder.encode(firstAudio);
+      firstAudio.close();
+
+      const pumpVideo = (async () => {
+        try {
+          while (isRecording) {
+            const { value: frame, done } = await videoReader.read();
+            if (done || !frame) break;
+            if (!isRecording) {
+              frame.close();
+              break;
+            }
+            if (videoEncoder.state === 'configured') {
+              videoEncoder.encode(frame, { keyFrame: videoFrameCount % 60 === 0 });
+              videoFrameCount++;
+            }
+            frame.close();
+          }
+        } catch (_) {}
+      })();
+
+      const pumpAudio = (async () => {
+        try {
+          while (isRecording) {
+            const { value: data, done } = await audioReader.read();
+            if (done || !data) break;
+            if (!isRecording) {
+              data.close();
+              break;
+            }
+            if (audioEncoder.state === 'configured') {
+              audioEncoder.encode(data);
+            }
+            data.close();
+          }
+        } catch (_) {}
+      })();
+
+      activeStopHandler = async () => {
+        const durationMs = stopTimer();
+        setRecordingUI(false);
+        recordToggleBtn.disabled = true;
+        recordLabel.textContent = 'Saving...';
+
+        await Promise.allSettled([videoReader.cancel(), audioReader.cancel()]);
+        await Promise.allSettled([pumpVideo, pumpAudio]);
+
+        if (videoEncoder.state === 'configured') await videoEncoder.flush();
+        if (audioEncoder.state === 'configured') await audioEncoder.flush();
+        if (videoEncoder.state !== 'closed') videoEncoder.close();
+        if (audioEncoder.state !== 'closed') audioEncoder.close();
+
+        muxer.finalize();
+        const blob = new Blob([muxer.target.buffer], { type: 'video/mp4' });
+        publishDownload(blob, 'mp4', durationMs);
+
+        recordToggleBtn.disabled = false;
+        recordLabel.textContent = 'Record';
+      };
+    }
+
+    // Fallback Recorder: Single-cluster MediaRecorder (no 250ms fragmentation)
+    function startFallbackRecorder(mediaStream) {
+      const preferredTypes = [
+        'video/mp4;codecs=avc1,mp4a.40.2',
+        'video/mp4',
+        'video/webm;codecs=vp8,opus',
+        'video/webm'
+      ];
+      const selectedMimeType = preferredTypes.find((t) => MediaRecorder.isTypeSupported(t)) || '';
+      const chunks = [];
+      const recorder = new MediaRecorder(mediaStream, selectedMimeType ? { mimeType: selectedMimeType } : undefined);
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+      };
+
+      setRecordingUI(true);
+      recorder.start(); // No timeslice argument prevents multi-fragment 00:00 header corruption
+
+      activeStopHandler = () => new Promise((resolve) => {
+        const durationMs = stopTimer();
+        setRecordingUI(false);
+        recorder.onstop = () => {
+          const finalMime = recorder.mimeType || selectedMimeType || 'video/mp4';
+          const ext = finalMime.includes('mp4') ? 'mp4' : 'webm';
+          const blob = new Blob(chunks, { type: finalMime });
+          publishDownload(blob, ext, durationMs);
+          resolve();
+        };
+        recorder.stop();
+      });
+    }
 
     launchBtn.addEventListener('click', async () => {
       try {
@@ -195,64 +455,27 @@ Your front camera displays behind the script so you maintain eye contact while r
       playPauseIcon.textContent = isScrolling ? '❚❚' : '▶';
     });
 
-    recordToggleBtn.addEventListener('click', () => {
+    recordToggleBtn.addEventListener('click', async () => {
       if (!isRecording) {
-        recordedChunks = [];
-
-        // Prioritize native MP4 codecs first, falling back to WebM only on older engines
-        const preferredTypes = [
-          'video/mp4;codecs=avc1,mp4a.40.2',
-          'video/mp4;codecs=h264,aac',
-          'video/mp4',
-          'video/webm;codecs=vp8,opus',
-          'video/webm'
-        ];
-        const selectedMimeType = preferredTypes.find((type) => MediaRecorder.isTypeSupported(type)) || '';
-
-        mediaRecorder = new MediaRecorder(stream, selectedMimeType ? { mimeType: selectedMimeType } : undefined);
-
-        mediaRecorder.ondataavailable = (e) => {
-          if (e.data && e.data.size > 0) recordedChunks.push(e.data);
-        };
-
-        mediaRecorder.onstop = () => {
-          const finalMime = mediaRecorder.mimeType || selectedMimeType || 'video/mp4';
-          const ext = finalMime.includes('mp4') ? 'mp4' : 'webm';
-          const blob = new Blob(recordedChunks, { type: finalMime });
-          const url = URL.createObjectURL(blob);
-
-          downloadBtn.href = url;
-          downloadBtn.download = `teleprompter-${Date.now()}.${ext}`;
-          downloadBtn.textContent = `Save Video (.${ext})`;
-          downloadBanner.classList.remove('hidden');
-        };
-
-        mediaRecorder.start(250);
-        isRecording = true;
-        isScrolling = true;
-        playPauseIcon.textContent = '❚❚';
-        recordLabel.textContent = 'Stop';
-        recordToggleBtn.classList.replace('bg-red-600', 'bg-slate-200');
-        recordToggleBtn.classList.replace('text-white', 'text-slate-950');
-        recordDot.classList.replace('bg-white', 'bg-red-600');
-        recordDot.classList.remove('rounded-full');
-        recIndicator.classList.remove('hidden');
-      } else {
-        mediaRecorder.stop();
-        isRecording = false;
-        isScrolling = false;
-        playPauseIcon.textContent = '▶';
-        recordLabel.textContent = 'Record';
-        recordToggleBtn.classList.replace('bg-slate-200', 'bg-red-600');
-        recordToggleBtn.classList.replace('text-slate-950', 'text-white');
-        recordDot.classList.replace('bg-red-600', 'bg-white');
-        recordDot.classList.add('rounded-full');
-        recIndicator.classList.add('hidden');
+        try {
+          await startWebCodecsMp4Recorder(stream);
+        } catch (err) {
+          console.warn('Falling back to MediaRecorder:', err);
+          startFallbackRecorder(stream);
+        }
+      } else if (activeStopHandler) {
+        const stopFn = activeStopHandler;
+        activeStopHandler = null;
+        await stopFn();
       }
     });
 
-    exitBtn.addEventListener('click', () => {
-      if (isRecording) recordToggleBtn.click();
+    exitBtn.addEventListener('click', async () => {
+      if (isRecording && activeStopHandler) {
+        const stopFn = activeStopHandler;
+        activeStopHandler = null;
+        await stopFn();
+      }
       isScrolling = false;
       playPauseIcon.textContent = '▶';
       if (stream) {
