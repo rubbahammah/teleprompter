@@ -257,7 +257,29 @@ Your front camera displays behind the script so you maintain eye contact while r
       topDownloadBtn.classList.remove('hidden');
     }
 
-    // Patches mvhd, tkhd, and mdhd duration atoms in MediaRecorder MP4 blobs
+    // Normalizes AudioData to f32-planar with clean 0-based timestamps
+    function normalizeAudioData(audioData, timestampUs) {
+      const numChannels = audioData.numberOfChannels;
+      const numFrames = audioData.numberOfFrames;
+      const sampleRate = audioData.sampleRate;
+      const buffer = new Float32Array(numFrames * numChannels);
+      for (let ch = 0; ch < numChannels; ch++) {
+        audioData.copyTo(buffer.subarray(ch * numFrames, (ch + 1) * numFrames), {
+          planeIndex: ch,
+          format: 'f32-planar'
+        });
+      }
+      return new AudioData({
+        format: 'f32-planar',
+        sampleRate,
+        numberOfFrames: numFrames,
+        numberOfChannels: numChannels,
+        timestamp: timestampUs,
+        data: buffer
+      });
+    }
+
+    // Patches mvhd, tkhd, mdhd, and mehd duration atoms in MediaRecorder MP4 blobs
     function patchMp4Duration(buffer, durationMs) {
       const view = new DataView(buffer);
       let mvhdTimescale = 1000;
@@ -275,7 +297,7 @@ Your front camera displays behind the script so you maintain eye contact while r
           );
           const payload = offset + 8;
 
-          if (type === 'moov' || type === 'trak' || type === 'mdia') {
+          if (type === 'moov' || type === 'trak' || type === 'mdia' || type === 'mvex') {
             walkBoxes(payload, offset + size);
           } else if (type === 'mvhd' && payload + 20 <= offset + size) {
             const v = view.getUint8(payload);
@@ -302,6 +324,13 @@ Your front camera displays behind the script so you maintain eye contact while r
               const ts = view.getUint32(payload + 20) || 1000;
               view.setBigUint64(payload + 24, BigInt(Math.round((durationMs / 1000) * ts)));
             }
+          } else if (type === 'mehd' && payload + 8 <= offset + size) {
+            const v = view.getUint8(payload);
+            if (v === 0) {
+              view.setUint32(payload + 4, Math.round((durationMs / 1000) * mvhdTimescale));
+            } else if (v === 1 && payload + 12 <= offset + size) {
+              view.setBigUint64(payload + 4, BigInt(Math.round((durationMs / 1000) * mvhdTimescale)));
+            }
           }
           offset += size;
         }
@@ -315,7 +344,7 @@ Your front camera displays behind the script so you maintain eye contact while r
       return buffer;
     }
 
-    // Primary Recorder: WebCodecs + Mp4Muxer with cloned tracks
+    // Primary Recorder: Canvas-backed WebCodecs + Mp4Muxer
     async function startWebCodecsMp4Recorder(mediaStream) {
       if (
         typeof Mp4Muxer === 'undefined' ||
@@ -330,14 +359,15 @@ Your front camera displays behind the script so you maintain eye contact while r
       const origAudioTrack = mediaStream.getAudioTracks()[0];
       if (!origVideoTrack || !origAudioTrack) throw new Error('Missing audio or video track');
 
-      // Clone tracks so stopping them cleanly closes the readers without affecting live preview
       const recVideoTrack = origVideoTrack.clone();
       const recAudioTrack = origAudioTrack.clone();
 
-      let videoReader, audioReader;
+      let firstFrame = null;
+      let firstAudio = null;
+
       try {
-        videoReader = new MediaStreamTrackProcessor({ track: recVideoTrack }).readable.getReader();
-        audioReader = new MediaStreamTrackProcessor({ track: recAudioTrack }).readable.getReader();
+        const videoReader = new MediaStreamTrackProcessor({ track: recVideoTrack }).readable.getReader();
+        const audioReader = new MediaStreamTrackProcessor({ track: recAudioTrack }).readable.getReader();
 
         const [firstVidRes, firstAudRes] = await withTimeout(
           Promise.all([videoReader.read(), audioReader.read()]),
@@ -348,48 +378,47 @@ Your front camera displays behind the script so you maintain eye contact while r
           throw new Error('Initial frame read failed');
         }
 
-        const firstFrame = firstVidRes.value;
-        const firstAudio = firstAudRes.value;
+        firstFrame = firstVidRes.value;
+        firstAudio = firstAudRes.value;
 
         const rawW = firstFrame.codedWidth || 720;
         const rawH = firstFrame.codedHeight || 1280;
-        // Align to 16px macroblocks for Android hardware H.264 encoders
         const width = Math.max(16, Math.floor(rawW / 16) * 16);
         const height = Math.max(16, Math.floor(rawH / 16) * 16);
-        const needsResize = (width !== rawW || height !== rawH);
 
-        let resizeCanvas = null;
-        let resizeCtx = null;
-        if (needsResize) {
-          resizeCanvas = document.createElement('canvas');
-          resizeCanvas.width = width;
-          resizeCanvas.height = height;
-          resizeCtx = resizeCanvas.getContext('2d');
-        }
+        // Always draw onto a 2D canvas to convert Android AHardwareBuffer textures into RGBA frames
+        const frameCanvas = document.createElement('canvas');
+        frameCanvas.width = width;
+        frameCanvas.height = height;
+        const frameCtx = frameCanvas.getContext('2d', { alpha: false });
 
-        const normalizeFrame = (frame) => {
-          if (!needsResize) return frame;
-          resizeCtx.drawImage(frame, 0, 0, width, height);
-          const aligned = new VideoFrame(resizeCanvas, { timestamp: frame.timestamp });
-          frame.close();
-          return aligned;
+        const toCanvasVideoFrame = (rawFrame, timestampUs) => {
+          frameCtx.drawImage(rawFrame, 0, 0, width, height);
+          rawFrame.close();
+          return new VideoFrame(frameCanvas, { timestamp: timestampUs });
         };
 
         const sampleRate = firstAudio.sampleRate || 48000;
         const numberOfChannels = firstAudio.numberOfChannels || 1;
 
-        const avcCandidates = ['avc1.42002a', 'avc1.4d002a', 'avc1.64002a', 'avc1.42001f'];
-        let chosenAvc = null;
-        for (const codec of avcCandidates) {
+        const codecCandidates = [
+          { codec: 'avc1.42001f', hardwareAcceleration: 'no-preference' },
+          { codec: 'avc1.42002a', hardwareAcceleration: 'no-preference' },
+          { codec: 'avc1.4d002a', hardwareAcceleration: 'no-preference' },
+          { codec: 'avc1.42001f', hardwareAcceleration: 'prefer-software' }
+        ];
+
+        let chosenConfig = null;
+        for (const cand of codecCandidates) {
           const support = await VideoEncoder.isConfigSupported({
-            codec,
+            ...cand,
             width,
             height,
             bitrate: 2_500_000,
             framerate: 30
           });
           if (support.supported) {
-            chosenAvc = codec;
+            chosenConfig = cand;
             break;
           }
         }
@@ -401,13 +430,14 @@ Your front camera displays behind the script so you maintain eye contact while r
           bitrate: 128_000
         });
 
-        if (!chosenAvc || !aacSupport.supported) {
-          firstFrame.close();
-          firstAudio.close();
-          throw new Error('Hardware H.264/AAC config unsupported');
+        if (!chosenConfig || !aacSupport.supported) {
+          throw new Error('H.264 or AAC WebCodecs config unsupported');
         }
 
         let encoderFailed = false;
+        let lastEncoderError = null;
+        let encodedVideoChunks = 0;
+
         const muxer = new Mp4Muxer.Muxer({
           target: new Mp4Muxer.ArrayBufferTarget(),
           video: { codec: 'avc', width, height },
@@ -417,14 +447,18 @@ Your front camera displays behind the script so you maintain eye contact while r
         });
 
         const videoEncoder = new VideoEncoder({
-          output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+          output: (chunk, meta) => {
+            encodedVideoChunks++;
+            muxer.addVideoChunk(chunk, meta);
+          },
           error: (e) => {
             console.error('VideoEncoder error:', e);
             encoderFailed = true;
+            lastEncoderError = e;
           }
         });
         videoEncoder.configure({
-          codec: chosenAvc,
+          ...chosenConfig,
           width,
           height,
           bitrate: 2_500_000,
@@ -436,6 +470,7 @@ Your front camera displays behind the script so you maintain eye contact while r
           error: (e) => {
             console.error('AudioEncoder error:', e);
             encoderFailed = true;
+            lastEncoderError = e;
           }
         });
         audioEncoder.configure({
@@ -445,16 +480,32 @@ Your front camera displays behind the script so you maintain eye contact while r
           bitrate: 128_000
         });
 
-        setRecordingUI(true);
+        // Encode initial frame and audio packet at timestamp 0 to verify encoder health before starting UI
+        const basePerfMs = performance.now();
+        let lastVideoTsUs = 0;
+        let totalAudioSamples = 0;
 
-        let videoFrameCount = 0;
-        const initialAlignedFrame = normalizeFrame(firstFrame);
-        videoEncoder.encode(initialAlignedFrame, { keyFrame: true });
-        initialAlignedFrame.close();
-        videoFrameCount++;
+        const initVidFrame = toCanvasVideoFrame(firstFrame, 0);
+        firstFrame = null;
+        videoEncoder.encode(initVidFrame, { keyFrame: true });
+        initVidFrame.close();
 
-        audioEncoder.encode(firstAudio);
+        const initAudioData = normalizeAudioData(firstAudio, 0);
+        totalAudioSamples += firstAudio.numberOfFrames;
         firstAudio.close();
+        firstAudio = null;
+        audioEncoder.encode(initAudioData);
+        initAudioData.close();
+
+        await sleep(60);
+        if (encoderFailed) {
+          if (videoEncoder.state !== 'closed') videoEncoder.close();
+          if (audioEncoder.state !== 'closed') audioEncoder.close();
+          throw lastEncoderError || new Error('Encoder rejected initial frame');
+        }
+
+        setRecordingUI(true);
+        let videoFrameCount = 1;
 
         const pumpVideo = (async () => {
           try {
@@ -465,9 +516,13 @@ Your front camera displays behind the script so you maintain eye contact while r
                 frame.close();
                 break;
               }
-              const readyFrame = normalizeFrame(frame);
-              videoEncoder.encode(readyFrame, { keyFrame: videoFrameCount % 60 === 0 });
-              readyFrame.close();
+              let tsUs = Math.max(0, Math.round((performance.now() - basePerfMs) * 1000));
+              if (tsUs <= lastVideoTsUs) tsUs = lastVideoTsUs + 1000;
+              lastVideoTsUs = tsUs;
+
+              const cleanFrame = toCanvasVideoFrame(frame, tsUs);
+              videoEncoder.encode(cleanFrame, { keyFrame: videoFrameCount % 60 === 0 });
+              cleanFrame.close();
               videoFrameCount++;
             }
           } catch (_) {}
@@ -482,8 +537,13 @@ Your front camera displays behind the script so you maintain eye contact while r
                 data.close();
                 break;
               }
-              audioEncoder.encode(data);
+              const audioTsUs = Math.round((totalAudioSamples / sampleRate) * 1_000_000);
+              totalAudioSamples += data.numberOfFrames;
+
+              const cleanAudio = normalizeAudioData(data, audioTsUs);
               data.close();
+              audioEncoder.encode(cleanAudio);
+              cleanAudio.close();
             }
           } catch (_) {}
         })();
@@ -495,7 +555,6 @@ Your front camera displays behind the script so you maintain eye contact while r
           recordLabel.textContent = 'Saving...';
 
           try {
-            // Stopping cloned tracks immediately ends both readable streams
             recVideoTrack.stop();
             recAudioTrack.stop();
 
@@ -516,30 +575,32 @@ Your front camera displays behind the script so you maintain eye contact while r
             if (videoEncoder.state !== 'closed') videoEncoder.close();
             if (audioEncoder.state !== 'closed') audioEncoder.close();
 
-            muxer.finalize();
-            const buffer = muxer.target.buffer;
-            if (!buffer || buffer.byteLength < 1024) {
-              throw new Error('Empty MP4 buffer generated');
+            if (encodedVideoChunks === 0) {
+              throw new Error('No video chunks encoded');
             }
 
+            muxer.finalize();
+            const buffer = muxer.target.buffer;
             const blob = new Blob([buffer], { type: 'video/mp4' });
             publishDownload(blob, 'mp4', durationMs);
           } catch (err) {
             console.error('Stop finalization error:', err);
-            alert('Unable to finalize video file. Please try recording again.');
+            alert('Unable to finalize video file: ' + (err?.message || 'Encoder error'));
           } finally {
             recordToggleBtn.disabled = false;
             recordLabel.textContent = 'Record';
           }
         };
       } catch (setupErr) {
+        if (firstFrame) firstFrame.close();
+        if (firstAudio) firstAudio.close();
         recVideoTrack.stop();
         recAudioTrack.stop();
         throw setupErr;
       }
     }
 
-    // Fallback Recorder: Single-cluster MediaRecorder with MP4 duration header patching
+    // Fallback Recorder: Single-cluster MediaRecorder with full MP4 duration header patching
     function startFallbackRecorder(mediaStream) {
       const preferredTypes = [
         'video/mp4;codecs=avc1,mp4a.40.2',
